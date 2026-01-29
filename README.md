@@ -7,7 +7,7 @@ This project is a web and desktop application for visualizing chemical equipment
 ```
 chemical-equipment-visualizer/
 │
-├── repo-root/backend/manage.py                # Django backend and analytics API
+├── backend/manage.py                # Django backend and analytics API
 │   ├── requirements.txt
 │   ├── backend/
 │   │   ├── __init__.py
@@ -37,6 +37,7 @@ chemical-equipment-visualizer/
 │   └── requirements.txt
 │
 ├── sample_equipment_data.csv
+│
 └── README.md
 ```
 
@@ -65,9 +66,16 @@ pip install -r requirements.txt
 from django.db import models
 
 class Dataset(models.Model):
-    filename = models.CharField(max_length=200)
-    summary = models.JSONField()
-    uploaded_at = models.DateTimeField(auto_now_add=True)
+    filename = models.CharField(max_length=255)
+    analysis_result = models.JSONField()
+    created_at = models.DateTimeField(auto_now_add=True)
+
+    class Meta:
+        ordering = ["-created_at"]
+
+    def __str__(self):
+        return self.filename
+
 ```
 
 ### `analytics/utils.py`
@@ -75,15 +83,23 @@ class Dataset(models.Model):
 ```python
 import pandas as pd
 
-def analyze_csv(file):
-    df = pd.read_csv(file)
+REQUIRED_COLUMNS = {"Flowrate", "Pressure", "Temperature", "Type"}
+
+def analyze_csv(file_obj):
+    df = pd.read_csv(file_obj)
+
+    if not REQUIRED_COLUMNS.issubset(df.columns):
+        missing = REQUIRED_COLUMNS - set(df.columns)
+        raise ValueError(f"Missing columns: {', '.join(missing)}")
+
     return {
-        "total_equipment": len(df),
-        "avg_flowrate": df["Flowrate"].mean(),
-        "avg_pressure": df["Pressure"].mean(),
-        "avg_temperature": df["Temperature"].mean(),
-        "type_distribution": df["Type"].value_counts().to_dict()
+        "equipment_count": int(len(df)),
+        "average_flowrate": float(df["Flowrate"].mean()),
+        "average_pressure": float(df["Pressure"].mean()),
+        "average_temperature": float(df["Temperature"].mean()),
+        "equipment_types": df["Type"].value_counts().to_dict(),
     }
+
 ```
 
 ### `analytics/views.py`
@@ -92,42 +108,71 @@ def analyze_csv(file):
 from rest_framework.views import APIView
 from rest_framework.response import Response
 from rest_framework.permissions import IsAuthenticated
+from rest_framework import status
+
 from .models import Dataset
 from .utils import analyze_csv
 
-class UploadCSV(APIView):
+class UploadCSVView(APIView):
     permission_classes = [IsAuthenticated]
 
     def post(self, request):
-        file = request.FILES['file']
-        summary = analyze_csv(file)
+        if "file" not in request.FILES:
+            return Response(
+                {"error": "CSV file not provided"},
+                status=status.HTTP_400_BAD_REQUEST
+            )
 
-        Dataset.objects.create(filename=file.name, summary=summary)
+        csv_file = request.FILES["file"]
 
-        # Keep only 5 most recent
-        if Dataset.objects.count() > 5:
-            Dataset.objects.order_by('uploaded_at').first().delete()
+        try:
+            summary = analyze_csv(csv_file)
+        except Exception as exc:
+            return Response(
+                {"error": str(exc)},
+                status=status.HTTP_400_BAD_REQUEST
+            )
 
-        return Response(summary)
+        Dataset.objects.create(
+            filename=csv_file.name,
+            analysis_result=summary
+        )
 
-class History(APIView):
+        # Keep only the 5 most recent records
+        excess = Dataset.objects.all()[5:]
+        if excess.exists():
+            excess.delete()
+
+        return Response(summary, status=status.HTTP_200_OK)
+
+
+class AnalysisHistoryView(APIView):
     permission_classes = [IsAuthenticated]
 
     def get(self, request):
-        data = Dataset.objects.order_by('-uploaded_at')[:5]
-        return Response([d.summary for d in data])
+        datasets = Dataset.objects.all()[:5]
+        return Response([
+            {
+                "filename": d.filename,
+                "created_at": d.created_at,
+                "summary": d.analysis_result
+            }
+            for d in datasets
+        ])
+
 ```
 
 ### `analytics/urls.py`
 
 ```python
 from django.urls import path
-from .views import UploadCSV, History
+from .views import UploadCSVView, AnalysisHistoryView
 
 urlpatterns = [
-    path('upload/', UploadCSV.as_view()),
-    path('history/', History.as_view()),
+    path("upload/", UploadCSVView.as_view(), name="upload-csv"),
+    path("history/", AnalysisHistoryView.as_view(), name="analysis-history"),
 ]
+
 ```
 
 ### `backend/urls.py`
@@ -136,8 +181,9 @@ urlpatterns = [
 from django.urls import path, include
 
 urlpatterns = [
-    path('api/', include('analytics.urls')),
+    path("api/", include("analytics.urls")),
 ]
+
 ```
 
 ---
@@ -157,18 +203,27 @@ npm install
 ### `api.js`
 
 ```js
-export const uploadCSV = async (file, token) => {
+const API_URL = "http://localhost:8000/api/upload/";
+
+export async function uploadCSV(file, token) {
   const formData = new FormData();
   formData.append("file", file);
 
-  const res = await fetch("http://localhost:8000/api/upload/", {
+  const response = await fetch(API_URL, {
     method: "POST",
-    headers: { Authorization: `Token ${token}` },
-    body: formData
+    headers: {
+      Authorization: `Token ${token}`,
+    },
+    body: formData,
   });
 
-  return res.json();
-};
+  if (!response.ok) {
+    throw new Error("Upload failed");
+  }
+
+  return response.json();
+}
+
 ```
 
 ### `App.js`
@@ -191,19 +246,42 @@ export default App;
 ### `components/Upload.js`
 
 ```js
+import { useState } from "react";
 import { uploadCSV } from "../api";
 
 function Upload() {
-  const handleUpload = async (e) => {
-    const file = e.target.files[0];
-    const data = await uploadCSV(file, "YOUR_TOKEN");
-    console.log(data);
+  const [result, setResult] = useState(null);
+
+  const handleFileChange = async (event) => {
+    const file = event.target.files[0];
+    if (!file) return;
+
+    try {
+      const data = await uploadCSV(file, "YOUR_TOKEN");
+      setResult(data);
+    } catch (err) {
+      alert(err.message);
+    }
   };
 
-  return <input type="file" onChange={handleUpload} />;
+  return (
+    <div>
+      <input type="file" accept=".csv" onChange={handleFileChange} />
+
+      {result && (
+        <div>
+          <p>Total Equipment: {result.equipment_count}</p>
+          <p>Avg Flowrate: {result.average_flowrate.toFixed(2)}</p>
+          <p>Avg Pressure: {result.average_pressure.toFixed(2)}</p>
+          <p>Avg Temperature: {result.average_temperature.toFixed(2)}</p>
+        </div>
+      )}
+    </div>
+  );
 }
 
 export default Upload;
+
 ```
 
 ---
@@ -224,32 +302,74 @@ pip install -r requirements.txt
 ### `main.py`
 
 ```python
-import sys, requests
-from PyQt5.QtWidgets import QApplication, QWidget, QPushButton, QFileDialog
+import sys
+import requests
 import matplotlib.pyplot as plt
 
-class App(QWidget):
+from PyQt5.QtWidgets import (
+    QApplication,
+    QWidget,
+    QPushButton,
+    QFileDialog,
+    QMessageBox,
+)
+
+API_URL = "http://localhost:8000/api/upload/"
+AUTH_HEADER = {"Authorization": "Token YOUR_TOKEN"}
+
+
+class EquipmentApp(QWidget):
     def __init__(self):
         super().__init__()
-        self.btn = QPushButton("Upload CSV", self)
-        self.btn.clicked.connect(self.upload)
         self.setWindowTitle("Chemical Equipment Visualizer")
+
+        self.upload_button = QPushButton("Upload CSV", self)
+        self.upload_button.clicked.connect(self.upload_csv)
+
+        self.resize(300, 100)
         self.show()
 
-    def upload(self):
-        path, _ = QFileDialog.getOpenFileName(self, "Open CSV")
-        files = {'file': open(path, 'rb')}
-        headers = {'Authorization': 'Token YOUR_TOKEN'}
+    def upload_csv(self):
+        file_path, _ = QFileDialog.getOpenFileName(
+            self, "Select CSV File", "", "CSV Files (*.csv)"
+        )
 
-        res = requests.post("http://localhost:8000/api/upload/", files=files, headers=headers)
-        data = res.json()
+        if not file_path:
+            return
 
-        plt.bar(data["type_distribution"].keys(), data["type_distribution"].values())
+        try:
+            with open(file_path, "rb") as file:
+                response = requests.post(
+                    API_URL,
+                    files={"file": file},
+                    headers=AUTH_HEADER,
+                )
+
+            if response.status_code != 200:
+                raise RuntimeError(response.text)
+
+            data = response.json()
+            self.show_chart(data["equipment_types"])
+
+        except Exception as error:
+            QMessageBox.critical(self, "Error", str(error))
+
+    def show_chart(self, distribution):
+        labels = list(distribution.keys())
+        values = list(distribution.values())
+
+        plt.bar(labels, values)
+        plt.xlabel("Equipment Type")
+        plt.ylabel("Count")
+        plt.title("Equipment Distribution")
         plt.show()
 
-app = QApplication(sys.argv)
-window = App()
-sys.exit(app.exec_())
+
+if __name__ == "__main__":
+    app = QApplication(sys.argv)
+    window = EquipmentApp()
+    sys.exit(app.exec_())
+
 ```
 
 ---
@@ -262,11 +382,11 @@ A sample CSV (`sample_equipment_data.csv`) should be available in the root for t
 
 1. **Start backend:**  
    ```
-   python manage.py runserver
+  python manage.py runserver
    ```
 2. **Run web frontend:**  
    ```
-   npm start
+ npm start
    ```
 3. **Run desktop frontend:**  
    ```
